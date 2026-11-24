@@ -42,6 +42,7 @@ DROP_NOTICE = (
 )
 SEVERITIES = ("high", "warn")
 SEVERITY_RANK = {"high": 0, "warn": 1}
+SARIF_LEVEL = {"high": "error", "warn": "warning"}
 HEX64 = re.compile(r"^[0-9a-f]{64}$")
 MARKDOWN_SPECIAL = re.compile(r"([\\*_\[\]<>#|~`&])")
 MENTION = re.compile(r"(?<![\w/])@(\w{1,39})")
@@ -515,6 +516,63 @@ def render(args: argparse.Namespace) -> tuple[str, dict[str, object]]:
     return body, summary
 
 
+def render_sarif(
+    report: dict,
+    gauge_ref: str,
+    gauge_repo: str,
+    config: str,
+) -> dict[str, object]:
+    """SARIF 2.1.0 representation of the open findings in a Gauge report.
+
+    Severity mapping: high → error, warn → warning, per docs/SARIF_MAPPING.md.
+    Skipped/missing accounts produce no results; the state is in the Accounts table.
+    """
+    path = Path(config)
+    all_findings = collect_findings(report, path)
+    open_findings, _ = split_accepted(report, all_findings)
+
+    rules: dict[str, dict[str, object]] = {}
+    for finding in open_findings:
+        rule_id = finding["rule"]
+        if rule_id not in rules:
+            rules[rule_id] = {
+                "id": rule_id,
+                "name": rule_id,
+                "shortDescription": {"text": rule_id},
+            }
+
+    results: list[dict[str, object]] = []
+    for finding in open_findings:
+        results.append(
+            {
+                "ruleId": finding["rule"],
+                "level": SARIF_LEVEL.get(finding["severity"], "note"),
+                "message": {"text": finding["message"] or finding["rule"]},
+                "locations": [
+                    {"logicalLocations": [{"name": finding["account"], "kind": "account"}]}
+                ],
+            }
+        )
+
+    return {
+        "$schema": "https://json.schemastore.org/sarif-2.1.0.json",
+        "version": "2.1.0",
+        "runs": [
+            {
+                "tool": {
+                    "driver": {
+                        "name": "stellar-gauge",
+                        "version": str(report.get("tool_version", "")),
+                        "informationUri": f"https://github.com/{gauge_repo}",
+                        "rules": list(rules.values()),
+                    }
+                },
+                "results": results,
+            }
+        ],
+    }
+
+
 def parse_args(argv: list[str] | None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     parser.add_argument("--report", required=True)
@@ -538,6 +596,12 @@ def parse_args(argv: list[str] | None) -> argparse.Namespace:
         dest="summary_out",
         default="",
         help="write the counts as JSON for sync_issue.py",
+    )
+    parser.add_argument(
+        "--sarif-out",
+        dest="sarif_out",
+        default="",
+        help="write a SARIF 2.1.0 file to this path (skipped when empty)",
     )
     return parser.parse_args(argv)
 
@@ -630,6 +694,19 @@ def main(argv: list[str] | None = None) -> int:
                 p.unlink(missing_ok=True)
         print(f"render_report: cannot write {out}: {exc.strerror}", file=sys.stderr)
         return 2
+    if args.sarif_out:
+        sarif_path = Path(args.sarif_out)
+        try:
+            report_data = read_report(Path(args.report))
+            sarif = render_sarif(report_data, args.gauge_ref, args.gauge_repo, args.config)
+            sarif_path.parent.mkdir(parents=True, exist_ok=True)
+            sarif_path.write_text(json.dumps(sarif, indent=2) + "\n", encoding="utf-8")
+            result_count = len(sarif["runs"][0]["results"])  # type: ignore[index]
+            print(f"render_report: wrote SARIF {sarif_path} ({result_count} results)")
+        except (Refused, OSError) as exc:
+            print(f"render_report: cannot write SARIF: {exc}", file=sys.stderr)
+            return 2
+
     dropped = summary.get("dropped", 0)
     if dropped:
         print(f"render_report: dropped {dropped} finding row(s) to fit the body limit")

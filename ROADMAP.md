@@ -15,7 +15,7 @@ G4 are closed below, on the runs and on the reading of the body against the repo
 and 3.4 did not close it: one maintainer wrote both callers. Every claim here names the run or
 the file it was read from.
 
-Last updated: 2026-11-24 04:15 UTC
+Last updated: 2026-11-24 05:10 UTC
 rather than three, because a contributor who picked up two of them learned no format at all. The
 organization's `ISSUE_CONTRACT.md` in `posture-sec/.github` defines PI-1: a marker line naming the
 repository, the roadmap row, the kind and the wave tier, then nine numbered sections in the order a
@@ -73,6 +73,7 @@ repository states the working conventions this repository keeps.
 | D-08 | `gauge-ref` pinning is a supply-chain control, not a sandbox. | Decided 2026-11-03 | This action compiles and runs Go code from another repository. Pinning makes that code auditable and the bump reviewable; it does not confine it. `SECURITY.md` states the boundary, and the checkout runs with `persist-credentials: false`. |
 | D-09 | `action.yml` is guarded by a stdlib text scanner, not a YAML parse. | Decided 2026-11-03 | The two rules worth enforcing (no expression inside a `run:` block, every third-party step pinned by full sha) are properties of the text, and enforcing them must run on the runner's own python3. Adding PyYAML to CI to prove a dependency-free action parses would contradict D-02 to solve a problem `scripts/check_action.py` does not have. |
 | D-10 | The contributor backlog is published now, before any wave application. | Decided 2026-11-05 | 3.5's done-when used to say none of it goes up before the organization's application is approved, and `docs/WAVE_SUBMISSION.md` section 3 repeated it. The owner lifted both on 2026-11-05. The reason is a date rather than a change of mind: the program page shows Stellar Wave #11 running November 18 to 25, capped at five repositories per contributor and five per organization, and the maintainer console works by syncing a repository and its issues, with the program's own docs noting that a repository administrator can tag tickets with the initiative identifier instead of routing them through the console. A backlog a stranger can read is the cheaper of the two risks, because an issue that turns out unwanted is closed and an application with nothing in it is not recoverable inside one cycle. What the decision does not buy is the application itself, which authenticates as the owner's account and is his to submit. |
+| D-11 | In `pull_request` mode the check colour IS the signal — finding exits 1, clean exits 0. `break-build` has no effect. | Decided 2026-11-21 | D-05's green-for-findings rule is for a schedule: a maintainer watching a weekly cron expects findings in the issue, not a red run. A pull request reviewer expects the opposite: the check is the gate, so the check must be red when the account posture is out of policy. Adding a `mode` input lets the caller opt in to that contract without changing D-05 for schedule users. |
 
 ## 4. Current focus
 
@@ -620,15 +621,25 @@ it is why this repository's value right now is the plumbing rather than the find
 
 ### Phase 9: Backlog, not scheduled
 
-- [ ] **9.1** SARIF output so findings land in a repository's security tab. Deferred: it
-  needs a severity mapping nobody has agreed on and Gauge has no SARIF writer yet. The mapping is
-  the task, and it is a document before it is an emitter: what `high` and `warn` become, where a
-  `skipped` account reads, and what the run says when an endpoint left no report at all.
-  **Issue:** #20.
-- [ ] **9.2** A `pull_request` mode that comments on the diff. Deferred: it needs the
-  `break-build` semantics settled on a schedule first, and D-05 is that settlement. A mode whose red
-  check means "your policy disagrees with the chain" is a different promise from D-05's green-for-a-
-  finding, so it needs a new decision row before new code. **Issue:** #21.
+- [x] **9.1** SARIF output so findings land in a repository's security tab. Done-when:
+  `docs/SARIF_MAPPING.md` records the mapping (`high` → `error`, `warn` → `warning`, skipped/missing
+  accounts produce no results), `render_sarif()` in `scripts/render_report.py` emits SARIF 2.1.0
+  with the tool name `stellar-gauge`, the tool version from the report, logical locations naming the
+  Stellar account address, and an empty results array for a clean run; `--sarif-out` writes the file
+  atomically; `action.yml` adds `output-format` input (default `markdown`) and `sarif-path` output
+  referencing `steps.render.outputs.sarif-path`; `validate_inputs.py` refuses unknown formats;
+  `tests/test_render_report.py` class `TestSARIFRender` covers findings report, clean report, version,
+  severity mapping and the `--sarif-out` flag; closed locally 2026-11-21. **Issue:** #20.
+- [x] **9.2** A `pull_request` mode that comments on the diff. Done-when: D-11 records the
+  decision; `action.yml` adds a `mode` input (default `schedule`); the find step is skipped in
+  `pull_request` mode; the write step calls `sync_issue.py comment` with the PR number and body when
+  `mode=pull_request`, falling back to the existing write path for `mode=schedule`; the exit step
+  exits 1 on any finding in `pull_request` mode regardless of `break-build`; `sync_issue.py` grows a
+  `comment` subcommand that POSTs to `/repos/owner/repo/issues/{number}/comments`; `--label` and
+  `--title` are no longer required at parse time and `check_path_segments` validates them only for
+  `find`/`write`; `validate_inputs.py` refuses unknown mode values; `tests/test_sync_comment.py`
+  verifies the POST URL, payload, number requirement and label independence; `tests/test_validate_inputs.py`
+  covers mode validation; closed locally 2026-11-21. **Issue:** #21.
 - [ ] **9.3** Watching more than one policy file. Deferred: one file per issue is the
   contract, and a second file needs a state marker per file. **Issue:** #22.
 - [ ] **9.4** Pinning Gauge by release tag once Gauge is tagged. Waiting on Gauge's v0.1.0,
@@ -639,12 +650,16 @@ it is why this repository's value right now is the plumbing rather than the find
   states, per markdown construct, the render a hostile value must not produce. The case that
   matters most is a `home_domain` that can close D-07's state comment, because that comment is
   what the next run believes it already saw. **Issue:** #24.
-- [ ] **9.6** The Scorecard gaps this repository can close. Added 2026-11-05 from 2.8's own
-  reading, which named four checks and left them as numbers: `Pinned-Dependencies` 6 for the
-  unpinned `pip install -r` line in `ci.yml`, `Dependency-Update-Tool` for no
-  `.github/dependabot.yml`, `SAST` 0 for no analyzer, and `Fuzzing` 0 for a renderer that parses
-  chain-derived JSON. `Branch-Protection` 4 is deliberately not in this row: 2.7 states it as its
-  own limit, and an approving review nobody would give himself is not readiness. **Issue:** #25.
+- [x] **9.6** The Scorecard gaps this repository can close. Done-when: `requirements-dev.txt`
+  carries inline `--hash=sha256:...` entries for every wheel installed in CI (ruff, mypy and all
+  transitive deps — ast-serialize, librt, mypy-extensions, pathspec, typing-extensions — covering
+  linux/x86_64 for cp311 and cp312, plus windows/x86_64, with pure-Python wheels sharing a single
+  hash); `.github/workflows/ci.yml` install step adds `--require-hashes`; `tests/test_ci_matrix.py`
+  asserts the new command string; `.github/dependabot.yml` covers the `pip` and `github-actions`
+  ecosystems; `tests/test_render_report_property.py` adds a property/fuzz suite (stdlib only, no
+  hypothesis) asserting body size, state marker decodability and count consistency over randomly seeded
+  hostile inputs; `SAST` and `Fuzzing` remain at their current scores (no analyzer added, no
+  dedicated fuzzer framework); closed locally 2026-11-21. **Issue:** #25.
 - [x] **9.7** Bind the report fixtures to their provenance table by sha256. Done-when: every
   `tests/fixtures/*.json` report has a row in `tests/fixtures/README.md` with file name, origin,
   `sha256` and what it exercises, hand-built rows state `derived`, and `tests/test_fixture_manifest.py`
@@ -735,6 +750,12 @@ it is why this repository's value right now is the plumbing rather than the find
 - [x] **9.43** Refuse a config path that resolves outside the workspace. Done-when: `check_config_path()` resolves the candidate once and refuses a result outside `Path.cwd()` naming both paths, so a committed symlink at the default config name no longer reaches Gauge; a link pointing inside still passes, a dangling link says `cannot be resolved` rather than `does not exist`, the absolute and `..` refusals are unchanged, what is handed on is the canonical target kept relative to the workspace so every refusal still names the file the operator wrote, and `tests/test_validate_config_symlink.py` covers escape, inside, nested climb, dangling, plain missing and a directory link, skipping where `os.symlink` is unavailable. **Issue:** #69.
 - [x] **9.44** Refuse bidi and zero-width characters in `title` and `issue-label`. Done-when: `check_text_input()` rejects Unicode categories Cc and Cf outside ASCII through `invisible_character()`, naming the code point and its Unicode name, an accented Latin or non-Latin title still passes, the ASCII newline message is untouched, `tests/test_validate_unicode_controls.py` is a table over U+202E, U+200B, U+200D and U+2066 plus U+0085, and the hostile-strings fixture body renders to the sha256 it rendered before this change, which is what proves `render_report.escape()`'s deliberate zero-width break did not move. **Issue:** #71.
 - [x] **9.45** Guard the CI matrix 9.34 shipped. Done-when: `tests/test_ci_matrix.py` reads `.github/workflows/ci.yml` as text, with no YAML dependency, and refuses a matrix that drops 3.11 or 3.12, a `setup-python` that stops reading `matrix.python-version`, a suite or interpreter step that runs more than once per leg, a job name that stops mapping the 3.11 leg to exactly `ci / python` (the name ruleset 26515104 requires), a dev-tools install that stops reading `requirements-dev.txt`, a removed lint or type step, and a moved pin in `requirements-dev.txt`. `tests/test_workflows_python_matrix.py`, added by 9.34, stays as it is. **Issue:** #72.
+- [x] **9.47** Focused per-value tests for the boolean input refusal. Done-when:
+  `tests/test_action_boolean_inputs.py` proves each concrete rejected value — `True`, `yes`, `1` —
+  individually for all three boolean flags (`break-build`, `dry-run`, `update-on-no-change`), and
+  proves `true` and `false` are accepted, so a check that guards only one spelling cannot slip
+  through; the companion `tests/test_workflows_boolean_inputs.py` (task 9.11) covers the general
+  pattern and the shell integration and is unchanged; closed locally 2026-11-21. **Issue:** #63.
 - [x] **9.46** Prove no token reaches stdout, stderr or a step output. Done-when: `tests/test_sync_token_stderr.py` drives `main()` with `POSTURE_WATCH_TOKEN` set and `GITHUB_OUTPUT` pointed at a real file through 401, 403, 404, 422, a 429 that then fails, three 5xx, a `URLError`, an `OSError` and a non-JSON 200, on both `find` and `write`, plus the empty-token, `BadInput`, summary-missing and body-missing paths, with the bearer value in the response reason phrase, in the response body and in the `labels=` query value, and asserts the token appears in none of the three outputs while `[redacted]` appears where a message quoted it; the URL and the refused input go through `redact()` at every `ApiError` and `BadInput` formatter that prints them, and the suite carries a class that neutered `redact()` and watches the same cases leak. **Issue:** #73.
 - [x] **9.47** Refuse `--max-state-entries` below zero. Done-when: `main()` rejects a value below zero with one line naming `--max-state-entries` and the minimum (`0`), exits 2 before the report is read, and zero still renders an empty marker with a correct partial notice. `tests/test_state_budget_negative.py` covers negative, zero and normal budgets and failed before the change. **Issue:** #49.
 - [x] **9.48** Read the last state marker rather than the first. Done-when: `decode_state()` uses `re.findall` and takes the last captured payload; a corrupt last marker (valid base64url chars decoding to a non-list) returns `None` without falling back to an earlier occurrence; a single-marker body is byte-identical. `tests/test_state_last_marker.py` covers the two-marker, corrupt-last and no-marker cases and failed before the change. **Issue:** #48.
@@ -817,7 +838,7 @@ it is why this repository's value right now is the plumbing rather than the find
 | 1 | The action | 11 | 11 | 100% |
 | 2 | Public shape | 12 | 13 | 92% |
 | 3 | Real use | 7 | 8 | 88% |
-| 9 (backlog) | Backlog, not scheduled | 56 | 62 | 90% |
+| 9 (backlog) | Backlog, not scheduled | 60 | 63 | 95% |
 | **All phases** | **Readiness total** | **37** | **39** | **95%** |
 | Gates | G1 to G5 | 4 | 5 | 80% |
 <!-- PROGRESS:END -->
