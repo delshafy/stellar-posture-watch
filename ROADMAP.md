@@ -15,7 +15,7 @@ G4 are closed below, on the runs and on the reading of the body against the repo
 and 3.4 did not close it: one maintainer wrote both callers. Every claim here names the run or
 the file it was read from.
 
-Last updated: 2026-11-25 07:45 UTC
+Last updated: 2026-11-25 08:45 UTC
 rather than three, because a contributor who picked up two of them learned no format at all. The
 organization's `ISSUE_CONTRACT.md` in `posture-sec/.github` defines PI-1: a marker line naming the
 repository, the roadmap row, the kind and the wave tier, then nine numbered sections in the order a
@@ -847,6 +847,7 @@ it is why this repository's value right now is the plumbing rather than the find
 
 | Date (UTC) | Change | Tasks |
 | --- | --- | --- |
+| 2026-11-25 | Merged `chore/9.6-pinned-dev-deps` (#29): `scripts/lock_dev_requirements.py` resolves the dev-tool closure through pip's own report, `requirements-dev.lock.txt` pins it by version and content hash, and `--check` refuses a bumped pin without a regenerated lock. Main had already closed 9.6 in `requirements-dev.txt` with inline hashes, so the roadmap keeps that wording and this row records the second, tested mechanism. | none ticked |
 | 2026-11-25 | Merged dependabot PR #174: routine dependency bump, merged after the roadmap gate asked for this row. No task changes and no behaviour change; the pinned tool and action versions move together. | none ticked |
 | 2026-11-09 | Finalized Drips Wave 11 submission packet (docs/WAVE_SUBMISSION.md) for Stellar Wave 11 (Nov 18–25, 2026), documenting 185 unit tests passing, live documentation site at https://posture-sec.github.io/stellar-posture-watch/, OpenSSF Scorecard aggregate 7.4, operational action.yml, and 6 scoped Wave backlog issues. | none ticked |
 | 2026-11-03 | The scaffold lands as one commit: `action.yml` with ten inputs and the exit-code mapping, `validate_inputs.py`, `render_report.py` and `sync_issue.py`, six report fixtures with a provenance table naming which four are real testnet reads, the copied roadmap guards with their self-test, and the README, CONTRIBUTING, SECURITY, ARCHITECTURE and `.github` shape. 129 tests pass locally with the transport seam and a loopback server, `ruff check` and `ruff format --check` are clean on Python 3.12.3, and no runner has executed any of it. Corrected 2026-11-04: this row also said `mypy` was clean, and it was not. Ten type errors were found the next day and are listed in the row below. | 0.1 to 0.7, 1.1 to 1.7, 2.1 to 2.5 |
