@@ -9,6 +9,10 @@ let a chain-written value mention a user, a team or ``@all``.
 Nothing here is printed to stdout except a one-line summary. The report body never
 reaches the log.
 
+Outputs are staged as temporaries in the destination directory and committed with
+os.replace, with the body replaced first and the summary second so the summary is
+the commit point.
+
 Exit codes: 0 wrote the body, 2 refused the input.
 """
 
@@ -16,10 +20,13 @@ from __future__ import annotations
 
 import argparse
 import base64
+import contextlib
 import datetime as dt
 import json
+import os
 import re
 import sys
+import tempfile
 from pathlib import Path
 from typing import TypedDict
 
@@ -27,11 +34,24 @@ MARKER_PREFIX = "<!-- posture-watch:state v1 "
 MARKER_SUFFIX = " -->"
 MAX_STATE_ENTRIES = 200
 MAX_MARKER_CHARS = 20_000
+#: The issue body ceiling, matching the API limit `sync_issue.py` trims against.
+BODY_LIMIT = 65_536
+DROP_NOTICE = (
+    "\n_{dropped} finding row(s) were left out of this body to stay under the "
+    "{limit}-character issue limit; the state marker still carries the full open set._\n"
+)
 SEVERITIES = ("high", "warn")
 SEVERITY_RANK = {"high": 0, "warn": 1}
+SARIF_LEVEL = {"high": "error", "warn": "warning"}
 HEX64 = re.compile(r"^[0-9a-f]{64}$")
 MARKDOWN_SPECIAL = re.compile(r"([\\*_\[\]<>#|~`&])")
 MENTION = re.compile(r"(?<![\w/])@(\w{1,39})")
+# Unicode format characters that must not reach the GitHub renderer unchanged.
+# U+202A-U+202E: LRE, RLE, PDF, LRO, RLO (bidirectional formatting)
+# U+2066-U+2069: LRI, RLI, FSI, PDI (bidirectional isolates)
+# U+200B-U+200D: ZWSP, ZWNJ, ZWJ (zero-width joiners / separators)
+# U+2060: WJ (word joiner); U+FEFF: BOM / ZWNBSP
+_BIDI_STRIP = re.compile("[‪-‮⁦-⁩​-‍⁠﻿]")
 NO_CHANGE_SUMMARY = "no change since the previous run"
 
 
@@ -52,10 +72,14 @@ class Refused(Exception):
 def escape(value: object) -> str:
     """Make a report-derived string safe to drop into issue markdown.
 
+    Strips bidi and zero-width Unicode format characters that cause visual spoofing.
     Backslash escapes the characters that can open markup, and any mention is broken
-    with a zero-width space so a hostile home domain cannot notify a user or ``@all``.
+    with a zero-width space entity so a hostile home domain cannot notify a user or
+    ``@all``.  The mention rewrite emits ``&#8203;`` as an HTML entity; because that
+    is ASCII it is unaffected by stripping the corresponding code point U+200B.
     """
-    text = MARKDOWN_SPECIAL.sub(r"\\\1", str(value))
+    text = _BIDI_STRIP.sub("", str(value))
+    text = MARKDOWN_SPECIAL.sub(r"\\\1", text)
     return MENTION.sub(lambda m: "@&#8203;" + m.group(1), text)
 
 
@@ -129,16 +153,15 @@ def split_accepted(
     report: dict, open_findings: list[Finding]
 ) -> tuple[list[Finding], list[Finding]]:
     """Findings the policy accepted, kept out of the change list on purpose."""
-    accepted_keys: set[tuple[str, str]] = set()
+    accepted_keys: set[str] = set()
     for account in report["accounts"]:
         for entry in account.get("findings") or []:
             if isinstance(entry, dict) and entry.get("accepted") is True:
-                accepted_keys.add((str(entry.get("rule_id")), str(entry.get("fingerprint"))))
+                accepted_keys.add(str(entry.get("fingerprint")))
     open_only: list[Finding] = []
     accepted: list[Finding] = []
     for finding in open_findings:
-        key = (finding["rule"], finding["fingerprint"])
-        (accepted if key in accepted_keys else open_only).append(finding)
+        (accepted if finding["fingerprint"] in accepted_keys else open_only).append(finding)
     return open_only, accepted
 
 
@@ -161,16 +184,44 @@ def encode_state(findings: list[Finding], budget: int = MAX_STATE_ENTRIES) -> tu
         limit = max(limit - max(1, len(ordered) // 8), 0)
 
 
+def _strip_fences(text: str) -> str:
+    """Remove fenced code blocks from *text* before state decoding (issue #53).
+
+    Both backtick (```) and tilde (~~~) fences of three or more characters are
+    stripped.  An unterminated fence consumes from its opening marker to the end
+    of the text, so a marker embedded in a code example cannot survive as state.
+    """
+    out: list[str] = []
+    pos = 0
+    for m in re.finditer(r"^(`{3,}|~{3,})[^\n]*\n?", text, re.MULTILINE):
+        if m.start() < pos:
+            continue
+        out.append(text[pos : m.start()])
+        fence_char = m.group(1)[0]
+        fence_len = len(m.group(1))
+        # Match the closing fence: same character, same or greater length, at line start.
+        close_re = r"^" + re.escape(fence_char * fence_len) + r"+[^\n]*$"
+        close = re.search(close_re, text[m.end() :], re.MULTILINE)
+        if close:
+            pos = m.end() + close.end()
+        else:
+            # Unterminated fence: consume to end of text.
+            return "".join(out)
+    out.append(text[pos:])
+    return "".join(out)
+
+
 def decode_state(text: str) -> list[Finding] | None:
     """The findings recorded by a previous run, or None if the body carries no state."""
-    match = re.search(
+    all_matches = re.findall(
         re.escape(MARKER_PREFIX) + r"([A-Za-z0-9_-]*)" + re.escape(MARKER_SUFFIX), text
     )
-    if not match:
+    if not all_matches:
         return None
-    padding = "=" * (-len(match.group(1)) % 4)
+    last = all_matches[-1]
+    padding = "=" * (-len(last) % 4)
     try:
-        payload = base64.urlsafe_b64decode(match.group(1) + padding)
+        payload = base64.urlsafe_b64decode(last + padding)
         entries = json.loads(payload)
     except (ValueError, json.JSONDecodeError):
         return None
@@ -202,6 +253,41 @@ def sort_findings(findings: list[Finding]) -> list[Finding]:
         findings,
         key=lambda f: (SEVERITY_RANK[f["severity"]], f["rule"], f["account"], f["fingerprint"]),
     )
+
+
+def fit_body(body: str) -> tuple[str, int]:
+    """Trim finding rows until the assembled body fits the issue ceiling.
+
+    Rows are dropped in blocks from the end of the document, which is the Current
+    findings table, and the notice names how many went. The counts line, the mode and
+    exit line, the account table and the state marker are never touched: the marker is
+    the last line and stays decodable, and it still carries the open set.
+    """
+    if len(body) <= BODY_LIMIT:
+        return body, 0
+
+    def row_indexes(lines: list[str]) -> list[int]:
+        return [
+            i
+            for i, line in enumerate(lines)
+            if line.startswith("| high |") or line.startswith("| warn |")
+        ]
+
+    lines = body.splitlines(keepends=True)
+    rows = row_indexes(lines)
+    dropped = 0
+    while rows and len("".join(lines)) > BODY_LIMIT:
+        block = max(1, len(rows) // 8)
+        remove = set(rows[-block:])
+        lines = [line for i, line in enumerate(lines) if i not in remove]
+        dropped += len(remove)
+        rows = row_indexes(lines)
+    if dropped:
+        for i, line in enumerate(lines):
+            if line.startswith(MARKER_PREFIX):
+                lines.insert(i, DROP_NOTICE.format(dropped=dropped, limit=BODY_LIMIT))
+                break
+    return "".join(lines), dropped
 
 
 def finding_rows(findings: list[Finding]) -> str:
@@ -239,6 +325,7 @@ def account_rows(report: dict) -> str:
                 f"| - | - | {escape(status)} |"
             )
             continue
+        check_snapshot_scalars(snapshot, f"accounts[{account.get('id', '?')}]")
         thresholds = snapshot.get("thresholds") or {}
         flags = snapshot.get("flags") or {}
         set_flags = (
@@ -269,6 +356,25 @@ def account_status(account: dict) -> str:
     if isinstance(skipped, str) and skipped:
         return f"not read: {skipped}"
     return "read"
+
+
+def check_snapshot_scalars(snapshot: dict, where: str) -> None:
+    """Refuse a snapshot whose ledger or thresholds are not plain integers.
+
+    A string ledger or threshold would add extra table cells and shift columns.
+    ``isinstance(x, bool)`` is needed because ``bool`` is a subclass of ``int``.
+    """
+    ledger = snapshot.get("ledger")
+    if not isinstance(ledger, int) or isinstance(ledger, bool):
+        raise Refused(f"{where}: snapshot.ledger must be an integer, got {type(ledger).__name__!r}")
+    thresholds = snapshot.get("thresholds") or {}
+    for name in ("low", "medium", "high"):
+        val = thresholds.get(name, 0)
+        if not isinstance(val, int) or isinstance(val, bool):
+            raise Refused(
+                f"{where}: snapshot.thresholds.{name} must be an integer, "
+                f"got {type(val).__name__!r}"
+            )
 
 
 def status_line(
@@ -308,16 +414,34 @@ def render(args: argparse.Namespace) -> tuple[str, dict[str, object]]:
     tool_version = report.get("tool_version")
     if not isinstance(tool_version, str) or not tool_version:
         raise Refused("the report carries no tool_version")
+    limits = report.get("limits")
+    if not isinstance(limits, str):
+        raise Refused("the report carries a non-string limits field")
 
     all_findings = collect_findings(report, Path(args.report))
     open_findings, accepted = split_accepted(report, all_findings)
+    _seen_fps: dict[str, str] = {}
+    _acc_index = {str(_snapshot(a).get("id")): i for i, a in enumerate(report["accounts"])}
+    for _f in open_findings:
+        _fp = _f["fingerprint"]
+        if _fp in _seen_fps:
+            _i0 = _acc_index.get(_seen_fps[_fp], "?")
+            _i1 = _acc_index.get(_f["account"], "?")
+            raise Refused(f"fingerprint {_fp} appears in both accounts[{_i0}] and accounts[{_i1}]")
+        _seen_fps[_fp] = _f["account"]
     current = {f["fingerprint"]: f for f in open_findings}
 
     previous: list[Finding] | None = None
-    if args.previous_body and Path(args.previous_body).exists():
-        previous = decode_state(
-            Path(args.previous_body).read_text(encoding="utf-8", errors="replace")
-        )
+    if args.previous_body:
+        prev_path = Path(args.previous_body)
+        if prev_path.exists():
+            try:
+                raw_body = prev_path.read_text(encoding="utf-8", errors="replace")
+                previous = decode_state(_strip_fences(raw_body))
+            except OSError as exc:
+                raise Refused(
+                    f"previous body {prev_path}: cannot read it ({exc.strerror})"
+                ) from None
 
     if previous is None:
         new, resolved, changed, baseline = list(current.values()), [], True, True
@@ -386,7 +510,67 @@ def render(args: argparse.Namespace) -> tuple[str, dict[str, object]]:
         "omitted": omitted,
         "as_of": args.as_of,
     }
-    return "".join(parts), summary
+    body, dropped = fit_body("".join(parts))
+    if dropped:
+        summary["dropped"] = dropped
+    return body, summary
+
+
+def render_sarif(
+    report: dict,
+    gauge_ref: str,
+    gauge_repo: str,
+    config: str,
+) -> dict[str, object]:
+    """SARIF 2.1.0 representation of the open findings in a Gauge report.
+
+    Severity mapping: high → error, warn → warning, per docs/SARIF_MAPPING.md.
+    Skipped/missing accounts produce no results; the state is in the Accounts table.
+    """
+    path = Path(config)
+    all_findings = collect_findings(report, path)
+    open_findings, _ = split_accepted(report, all_findings)
+
+    rules: dict[str, dict[str, object]] = {}
+    for finding in open_findings:
+        rule_id = finding["rule"]
+        if rule_id not in rules:
+            rules[rule_id] = {
+                "id": rule_id,
+                "name": rule_id,
+                "shortDescription": {"text": rule_id},
+            }
+
+    results: list[dict[str, object]] = []
+    for finding in open_findings:
+        results.append(
+            {
+                "ruleId": finding["rule"],
+                "level": SARIF_LEVEL.get(finding["severity"], "note"),
+                "message": {"text": finding["message"] or finding["rule"]},
+                "locations": [
+                    {"logicalLocations": [{"name": finding["account"], "kind": "account"}]}
+                ],
+            }
+        )
+
+    return {
+        "$schema": "https://json.schemastore.org/sarif-2.1.0.json",
+        "version": "2.1.0",
+        "runs": [
+            {
+                "tool": {
+                    "driver": {
+                        "name": "stellar-gauge",
+                        "version": str(report.get("tool_version", "")),
+                        "informationUri": f"https://github.com/{gauge_repo}",
+                        "rules": list(rules.values()),
+                    }
+                },
+                "results": results,
+            }
+        ],
+    }
 
 
 def parse_args(argv: list[str] | None) -> argparse.Namespace:
@@ -413,6 +597,12 @@ def parse_args(argv: list[str] | None) -> argparse.Namespace:
         default="",
         help="write the counts as JSON for sync_issue.py",
     )
+    parser.add_argument(
+        "--sarif-out",
+        dest="sarif_out",
+        default="",
+        help="write a SARIF 2.1.0 file to this path (skipped when empty)",
+    )
     return parser.parse_args(argv)
 
 
@@ -429,28 +619,97 @@ def main(argv: list[str] | None = None) -> int:
     if not re.fullmatch(r"[0-9a-f]{40}", args.gauge_ref):
         print("render_report: --gauge-ref must be a full 40-character commit sha", file=sys.stderr)
         return 2
+    if args.max_state_entries < 0:
+        print("render_report: --max-state-entries must be 0 or above", file=sys.stderr)
+        return 2
     try:
         body, summary = render(args)
     except Refused as exc:
         print(f"render_report: refused: {exc}", file=sys.stderr)
         return 2
     out = Path(args.out)
+    summary_path = Path(args.summary_out) if args.summary_out else None
     counts_text = (
         f"{summary['open']} open, {summary['high']} high, {summary['warn']} warn, "
         f"{summary['accepted']} accepted"
     )
     if not summary["changed"]:
         counts_text = f"{NO_CHANGE_SUMMARY} ({counts_text})"
+    tmp_out: Path | None = None
+    tmp_summary: Path | None = None
+    created: list[Path] = []
     try:
         out.parent.mkdir(parents=True, exist_ok=True)
-        out.write_text(body, encoding="utf-8")
-        if args.summary_out:
-            Path(args.summary_out).write_text(
-                json.dumps(summary, sort_keys=True) + "\n", encoding="utf-8"
-            )
+        if str(out).startswith("/dev/") or (
+            out.exists() and (out.is_char_device() or out.is_fifo())
+        ):
+            out.write_text(body, encoding="utf-8")
+        else:
+            with tempfile.NamedTemporaryFile(
+                mode="w", dir=out.parent, encoding="utf-8", delete=False
+            ) as f_body:
+                tmp_out = Path(f_body.name)
+                f_body.write(body)
+                f_body.flush()
+                os.fsync(f_body.fileno())
+
+        if summary_path:
+            summary_path.parent.mkdir(parents=True, exist_ok=True)
+            if str(summary_path).startswith("/dev/") or (
+                summary_path.exists() and (summary_path.is_char_device() or summary_path.is_fifo())
+            ):
+                summary_path.write_text(
+                    json.dumps(summary, sort_keys=True) + "\n", encoding="utf-8"
+                )
+            else:
+                with tempfile.NamedTemporaryFile(
+                    mode="w", dir=summary_path.parent, encoding="utf-8", delete=False
+                ) as f_sum:
+                    tmp_summary = Path(f_sum.name)
+                    f_sum.write(json.dumps(summary, sort_keys=True) + "\n")
+                    f_sum.flush()
+                    os.fsync(f_sum.fileno())
+
+        if tmp_out:
+            out_was_new = not out.exists()
+            os.replace(tmp_out, out)
+            tmp_out = None
+            if out_was_new:
+                created.append(out)
+        if summary_path and tmp_summary:
+            summary_was_new = not summary_path.exists()
+            os.replace(tmp_summary, summary_path)
+            tmp_summary = None
+            if summary_was_new:
+                created.append(summary_path)
     except OSError as exc:
+        if tmp_out and tmp_out.exists():
+            with contextlib.suppress(OSError):
+                tmp_out.unlink()
+        if tmp_summary and tmp_summary.exists():
+            with contextlib.suppress(OSError):
+                tmp_summary.unlink()
+        for p in created:
+            with contextlib.suppress(OSError):
+                p.unlink(missing_ok=True)
         print(f"render_report: cannot write {out}: {exc.strerror}", file=sys.stderr)
         return 2
+    if args.sarif_out:
+        sarif_path = Path(args.sarif_out)
+        try:
+            report_data = read_report(Path(args.report))
+            sarif = render_sarif(report_data, args.gauge_ref, args.gauge_repo, args.config)
+            sarif_path.parent.mkdir(parents=True, exist_ok=True)
+            sarif_path.write_text(json.dumps(sarif, indent=2) + "\n", encoding="utf-8")
+            result_count = len(sarif["runs"][0]["results"])  # type: ignore[index]
+            print(f"render_report: wrote SARIF {sarif_path} ({result_count} results)")
+        except (Refused, OSError) as exc:
+            print(f"render_report: cannot write SARIF: {exc}", file=sys.stderr)
+            return 2
+
+    dropped = summary.get("dropped", 0)
+    if dropped:
+        print(f"render_report: dropped {dropped} finding row(s) to fit the body limit")
     print(f"render_report: wrote {out} ({len(body)} characters); {counts_text}")
     return 0
 

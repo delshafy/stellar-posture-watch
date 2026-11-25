@@ -16,10 +16,13 @@ import argparse
 import re
 import sys
 import tomllib
+import unicodedata
 from pathlib import Path
 
 MAX_CONFIG_BYTES = 1024 * 1024
 MAX_TEXT_INPUT = 256
+# GitHub caps a label name at 50 characters; the title limit above is a different field.
+MAX_LABEL_CHARS = 50
 NETWORK_KEYWORDS = ("mainnet", "testnet")
 
 # A secret seed is the same length and alphabet as an account id with a different
@@ -117,14 +120,31 @@ def check_endpoint(url: str, problems: list[str]) -> None:
         problems.append(f"endpoint {url!r} has no host or carries a query string")
 
 
+def check_config_size(path: Path, size: int, problems: list[str]) -> bool:
+    """False, with the refusal appended, when `size` bytes is more than this script will parse."""
+    if size <= MAX_CONFIG_BYTES:
+        return True
+    problems.append(f"config {path}: {size} bytes is over the {MAX_CONFIG_BYTES} limit")
+    return False
+
+
 def check_policy(path: Path, problems: list[str]) -> None:
+    # The ceiling is a promise about what this process holds, so the first answer comes from the
+    # directory entry rather than from the bytes. The check after the read stays as a second one,
+    # not a replacement: a policy is allowed to grow between the two calls.
+    try:
+        size = path.stat().st_size
+    except OSError as exc:
+        problems.append(f"config {path}: cannot read it ({exc.strerror})")
+        return
+    if not check_config_size(path, size, problems):
+        return
     try:
         raw = path.read_bytes()
     except OSError as exc:
         problems.append(f"config {path}: cannot read it ({exc.strerror})")
         return
-    if len(raw) > MAX_CONFIG_BYTES:
-        problems.append(f"config {path}: {len(raw)} bytes is over the {MAX_CONFIG_BYTES} limit")
+    if not check_config_size(path, len(raw), problems):
         return
     text = raw.decode("utf-8", "replace")
     problems.extend(seed_findings(text))
@@ -152,8 +172,20 @@ def check_policy(path: Path, problems: list[str]) -> None:
     if not isinstance(endpoints, list) or not endpoints:
         problems.append(f"config {path}: endpoints must be a non-empty array")
     else:
-        for entry in endpoints:
+        # `check_endpoint` asks whether one entry is a usable URL. Whether two entries are the
+        # same URL is a different question, and unanswered it costs a full run: Gauge reads the
+        # account from the same host twice and the issue can carry one finding twice.
+        first_seen: dict[str, int] = {}
+        for index, entry in enumerate(endpoints):
             check_endpoint(entry, problems)
+            if not isinstance(entry, str):
+                continue
+            first = first_seen.setdefault(entry, index)
+            if first != index:
+                problems.append(
+                    f"config {path}: endpoint {entry} is listed twice, "
+                    f"at index {first} and index {index}"
+                )
 
     accounts = data.get("account")
     if not isinstance(accounts, list) or not accounts:
@@ -201,23 +233,96 @@ def check_config_path(value: str, problems: list[str]) -> Path | None:
     if ".." in candidate.parts:
         problems.append(f"config {value!r} must not climb out of the repository with ..")
         return None
-    if not candidate.exists():
-        problems.append(f"config {value!r} does not exist in the workspace")
+    # The two checks above read the string, and a string is not where a symlink lands. A
+    # committed link at `gauge.toml` whose target is outside the checkout passes both, and the
+    # `exists`/`is_file` calls below follow it, so the escape has to be judged on the resolved
+    # path. `SECURITY.md` promises confinement to the workspace; this is what makes it true.
+    workspace = Path.cwd().resolve()
+    resolved = candidate.resolve()
+    if not resolved.is_relative_to(workspace):
+        problems.append(
+            f"config {value!r} resolves to {resolved}, outside the workspace {workspace}"
+        )
         return None
-    if not candidate.is_file():
+    if not resolved.exists():
+        # `exists()` on a dangling symlink is False and says nothing about the link, so the
+        # operator reading "does not exist" would go looking for a file that was never missing.
+        if candidate.is_symlink():
+            problems.append(
+                f"config {value!r} is a symlink that cannot be resolved: it points at {resolved}"
+            )
+        else:
+            problems.append(f"config {value!r} does not exist in the workspace")
+        return None
+    if not resolved.is_file():
         problems.append(f"config {value!r} is not a regular file")
         return None
-    return candidate
+    # Canonical but still relative to the workspace, which is what every caller below reads and
+    # what every refusal names. Handing on the absolute form would rewrite the message a policy
+    # error prints from `config gauge.toml:` to the runner's checkout path, and the containment
+    # check above already guarantees this is the same file with no link and no `..` left in it.
+    return resolved.relative_to(workspace)
 
 
-def check_text_input(name: str, value: str, problems: list[str]) -> None:
+def invisible_character(value: str) -> str | None:
+    """A description of the first non-ASCII control or format character, or None.
+
+    `CONTROL_CHARS` is an ASCII range, so U+202E RIGHT-TO-LEFT OVERRIDE, U+200B ZERO WIDTH
+    SPACE, U+200D ZERO WIDTH JOINER and U+2066 LEFT-TO-RIGHT ISOLATE all walk through it.
+    Those are Unicode category Cf (plus Cc outside ASCII): they change how the title renders
+    without changing what a comparison sees, which is the difference between the issue title
+    and the bytes in the workflow file. Accented Latin and non-Latin scripts are Lo/Lu/Ll and
+    stay accepted; this refuses the invisible ones, by code point, not by alphabet.
+    """
+    for char in value:
+        if ord(char) < 0x80:
+            continue
+        category = unicodedata.category(char)
+        if category in ("Cc", "Cf"):
+            name = unicodedata.name(char, "")
+            named = f"U+{ord(char):04X} {name}" if name else f"U+{ord(char):04X}"
+            return f"{named} (category {category})"
+    return None
+
+
+def check_text_input(
+    name: str, value: str, problems: list[str], limit: int = MAX_TEXT_INPUT
+) -> None:
     if not value:
         problems.append(f"{name} must not be empty")
         return
-    if len(value) > MAX_TEXT_INPUT:
-        problems.append(f"{name} is {len(value)} characters, over the {MAX_TEXT_INPUT} limit")
+    if not value.strip():
+        # A title of spaces is truthy, so `not value` alone lets it reach the issue API, where
+        # it either cannot be created or is created rendering as nothing and cannot be adopted
+        # by the next run. The value is not trimmed on the way through: the run publishes what
+        # the operator wrote, or it does not run.
+        problems.append(f"{name} must not be blank")
+        return
+    if len(value) > limit:
+        problems.append(f"{name} is {len(value)} characters, over the {limit} limit")
     if CONTROL_CHARS.search(value) or "\n" in value:
         problems.append(f"{name} carries a control character or a line break")
+    hidden = invisible_character(value)
+    if hidden:
+        problems.append(
+            f"{name} carries {hidden}, a character that alters how the text renders; "
+            "control and format characters are refused"
+        )
+
+
+def check_boolean(name: str, value: str, problems: list[str]) -> None:
+    if value not in ("true", "false"):
+        problems.append(f"{name} must be true or false, got {value}")
+
+
+def check_output_format(value: str, problems: list[str]) -> None:
+    if value not in ("markdown", "sarif"):
+        problems.append(f"output-format {value!r} must be markdown or sarif")
+
+
+def check_mode(value: str, problems: list[str]) -> None:
+    if value not in ("schedule", "pull_request"):
+        problems.append(f"mode {value!r} must be schedule or pull_request")
 
 
 def validate(args: argparse.Namespace) -> list[str]:
@@ -231,8 +336,13 @@ def validate(args: argparse.Namespace) -> list[str]:
         problems.append(f"gauge-repo {args.gauge_repo!r} is not an owner/name pair")
     if args.fail_on not in ("high", "warn"):
         problems.append(f"fail-on {args.fail_on!r} must be high or warn")
-    check_text_input("issue-label", args.issue_label, problems)
+    check_text_input("issue-label", args.issue_label, problems, MAX_LABEL_CHARS)
     check_text_input("title", args.title, problems)
+    check_boolean("break-build", args.break_build, problems)
+    check_boolean("dry-run", args.dry_run, problems)
+    check_boolean("update-on-no-change", args.update_on_no_change, problems)
+    check_output_format(args.output_format, problems)
+    check_mode(args.mode, problems)
     config = check_config_path(args.config, problems)
     if config is not None:
         check_policy(config, problems)
@@ -247,6 +357,11 @@ def parse_args(argv: list[str] | None) -> argparse.Namespace:
     parser.add_argument("--fail-on", dest="fail_on", default="high")
     parser.add_argument("--issue-label", dest="issue_label", default="account-posture")
     parser.add_argument("--title", default="Account posture watch")
+    parser.add_argument("--break-build", default="false")
+    parser.add_argument("--dry-run", default="false")
+    parser.add_argument("--update-on-no-change", default="false")
+    parser.add_argument("--output-format", dest="output_format", default="markdown")
+    parser.add_argument("--mode", default="schedule")
     return parser.parse_args(argv)
 
 

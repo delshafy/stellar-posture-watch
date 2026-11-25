@@ -47,7 +47,9 @@ def pinned(requirements: Path) -> list[tuple[str, str]]:
     """The `name==version` pairs a requirements file states, in file order."""
     pairs: list[tuple[str, str]] = []
     for raw in requirements.read_text(encoding="utf-8").splitlines():
-        line = raw.split("#", 1)[0].strip()
+        # A pin with inline hashes continues onto the following lines with a trailing
+        # backslash; the continuation itself is not part of the version.
+        line = raw.split("#", 1)[0].strip().rstrip("\\").strip()
         if not line or "==" not in line:
             continue
         name, _, version = line.partition("==")
