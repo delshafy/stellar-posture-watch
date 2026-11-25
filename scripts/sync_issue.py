@@ -12,6 +12,7 @@ Exit codes: 0 done, 2 bad input, 3 the API could not be reached or answered wron
 from __future__ import annotations
 
 import argparse
+import datetime as dt
 import json
 import os
 import re
@@ -29,6 +30,8 @@ PATH_SEGMENT = re.compile(r"[A-Za-z0-9._-]{1,100}")
 CONTROL_CHARS = re.compile(r"[\x00-\x1f\x7f]")
 MAX_ATTEMPTS = 3
 MAX_RETRY_WAIT = 60.0
+ISSUE_PAGE_SIZE = 100
+MAX_ISSUE_PAGES = 50
 ACCEPT = "application/vnd.github+json"
 CURRENT_HEADER = "## Current findings"
 TRUNCATION_ROW = "| ... | ... | ... | ... | {remaining} more finding(s) truncated here |"
@@ -86,7 +89,9 @@ def api_base() -> str:
     base = base.rstrip("/")
     if not base.startswith("https://"):
         raise ApiError(f"GITHUB_API_URL {base!r} is not https")
-    if "://" not in base or "/" in base.split("://", 1)[1]:
+    if "://" not in base or not re.match(
+        r"^[a-zA-Z0-9.-]+(?::\d+)?(/api/v3)?$", base.split("://", 1)[1]
+    ):
         raise ApiError(f"GITHUB_API_URL {base!r} is not a bare scheme and host")
     return base
 
@@ -104,12 +109,48 @@ def retryable(exc: urllib.error.HTTPError) -> bool:
     return float(match.group(1)) <= MAX_RETRY_WAIT
 
 
-def request(method: str, url: str, token: str, payload: dict | None = None) -> tuple[int, bytes]:
-    """One call, with bounded retries. Returns the status and the response body."""
+def rate_limit_wait(headers: object) -> float | None:
+    """Seconds until the primary rate limit resets, or None when the headers say nothing.
+
+    GitHub's primary limit answers 403 with ``X-RateLimit-Remaining: 0`` and
+    ``X-RateLimit-Reset`` (epoch seconds) and no ``Retry-After``. Reading both keeps a
+    scheduled watch alive when the reset is seconds away instead of exiting 3.
+    """
+    if headers is None:
+        return None
+    remaining = (headers.get("X-RateLimit-Remaining") or "").strip()  # type: ignore[attr-defined]
+    reset = (headers.get("X-RateLimit-Reset") or "").strip()  # type: ignore[attr-defined]
+    if remaining != "0" or not re.fullmatch(r"\d+", reset):
+        return None
+    return float(reset) - time.time()
+
+
+def reset_timestamp(headers: object) -> str:
+    """The reset header as a UTC ISO timestamp, for a message a human reads."""
+    raw = (headers.get("X-RateLimit-Reset") or "").strip()  # type: ignore[attr-defined]
+    if not re.fullmatch(r"\d+", raw):
+        return "an unstated time"
+    stamp = dt.datetime.fromtimestamp(int(raw), dt.UTC)
+    return stamp.strftime("%Y-%m-%dT%H:%M:%SZ")
+
+
+def request(
+    method: str,
+    url: str,
+    token: str,
+    payload: dict | None = None,
+    attempts: int = MAX_ATTEMPTS,
+) -> tuple[int, bytes]:
+    """One call, with bounded retries. Returns the status and the response body.
+
+    ``attempts`` is the caller's retry policy. A GET is safe to repeat and defaults to
+    three; the create POST is not idempotent, so its caller asks for one attempt and a
+    lost response becomes an error rather than a duplicate issue.
+    """
     body = json.dumps(payload).encode() if payload is not None else None
     delay = 2.0
     last: Exception | None = None
-    for attempt in range(1, MAX_ATTEMPTS + 1):
+    for attempt in range(1, attempts + 1):
         headers = {
             "Authorization": f"Bearer {token}",
             "Accept": ACCEPT,
@@ -122,30 +163,68 @@ def request(method: str, url: str, token: str, payload: dict | None = None) -> t
             return TRANSPORT(method, url, headers, body)
         except urllib.error.HTTPError as exc:
             detail = exc.read()[:200].decode("utf-8", "replace")
-            if (exc.code in (401, 403, 429) and retryable(exc)) or exc.code >= 500:
+            reset_wait: float | None = None
+            if exc.code == 403 and exc.headers:
+                reset_wait = rate_limit_wait(exc.headers)
+                if reset_wait is not None and reset_wait > MAX_RETRY_WAIT:
+                    raise ApiError(
+                        f"{method} {redact(url)} -> 403: rate limit resets at "
+                        f"{reset_timestamp(exc.headers)}"
+                    ) from None
+            if (
+                (exc.code == 429 and retryable(exc))
+                or (
+                    exc.code == 403
+                    and exc.headers
+                    and "Retry-After" in exc.headers
+                    and retryable(exc)
+                )
+                or (exc.code == 403 and reset_wait is not None)
+                or exc.code >= 500
+            ):
                 last = exc
+                if reset_wait is not None:
+                    delay = max(reset_wait, 0.0)
             else:
-                raise ApiError(f"{method} {url} -> {exc.code}: {redact(detail)}") from None
+                raise ApiError(f"{method} {redact(url)} -> {exc.code}: {redact(detail)}") from None
         except (urllib.error.URLError, TimeoutError, OSError) as exc:
             last = exc
-        if attempt < MAX_ATTEMPTS:
+        if attempt < attempts:
             time.sleep(delay)
             delay = min(delay * 2, MAX_RETRY_WAIT)
     reason = redact(str(last)) if last is not None else "no attempt succeeded"
-    raise ApiError(f"{method} {url} failed after {MAX_ATTEMPTS} attempts: {reason}")
+    noun = "attempt" if attempts == 1 else "attempts"
+    raise ApiError(f"{method} {redact(url)} failed after {attempts} {noun}: {reason}")
 
 
 def redact(text: str) -> str:
-    return re.sub(r"(Bearer |token=)[A-Za-z0-9._-]+", r"\1[redacted]", text)[:200]
+    """Mask every secret-shaped run in a string before it reaches a log.
+
+    Both halves of an ApiError message go through this. The response body can echo the
+    bearer value, and the URL carries the label input as a query value, so a token pasted
+    into `issue-label` would otherwise come back in the refusal with the pattern intact.
+    """
+    return re.sub(
+        r"(Bearer |token=|[a-z0-9_]+=)[A-Za-z0-9._-]+|"
+        r"(gh[pousr]_[A-Za-z0-9_]{36,}|github_pat_[A-Za-z0-9_]{82,}|[A-Za-z0-9._-]{40,})",
+        r"\1[redacted]",
+        text,
+    )[:200]
 
 
-def get_json(method_target: str, token: str, url: str, payload: dict | None = None) -> object:
-    status, body = request(method_target, url, token, payload)
+def get_json(
+    method_target: str,
+    token: str,
+    url: str,
+    payload: dict | None = None,
+    attempts: int = MAX_ATTEMPTS,
+) -> object:
+    status, body = request(method_target, url, token, payload, attempts)
     try:
         return json.loads(body)
     except json.JSONDecodeError:
         raise ApiError(
-            f"{method_target} {url} -> {status} returned a body that is not JSON"
+            f"{method_target} {redact(url)} -> {status} returned a body that is not JSON"
         ) from None
 
 
@@ -156,7 +235,7 @@ def emit(name: str, value: str) -> None:
         with open(target, "a", encoding="utf-8") as handle:
             handle.write(f"{name}={value}\n")
     else:
-        print(f"::set-output name={name}::{value}")
+        print(f"posture-watch: {name}={value}")
 
 
 def find_issue(
@@ -165,18 +244,18 @@ def find_issue(
     """The open issue carrying our state marker, or one with our title to adopt."""
     base = api_base()
     adopt: int | None = None
-    for page in range(1, 6):
+    for page in range(1, MAX_ISSUE_PAGES + 1):
         url = (
             f"{base}/repos/{owner}/{repo}/issues?state=open"
-            f"&labels={urllib.parse.quote(label)}&per_page=100&page={page}"
+            f"&labels={urllib.parse.quote(label)}&per_page={ISSUE_PAGE_SIZE}&page={page}"
         )
         batch = get_json("GET", token, url)
         if not isinstance(batch, list):
             raise ApiError(f"the issue list on page {page} is not an array")
         if not batch:
-            break
+            return adopt
         for entry in batch:
-            if not isinstance(entry, dict):
+            if not isinstance(entry, dict) or "pull_request" in entry:
                 continue
             number = entry.get("number")
             body = entry.get("body")
@@ -188,6 +267,12 @@ def find_issue(
                 return number
             if entry.get("title") == title and adopt is None:
                 adopt = number
+        if len(batch) < ISSUE_PAGE_SIZE:
+            return adopt
+    print(
+        f"sync_issue: stopped after {MAX_ISSUE_PAGES} pages of "
+        f"{ISSUE_PAGE_SIZE}; a state marker may sit beyond them"
+    )
     return adopt
 
 
@@ -271,11 +356,14 @@ def run_write(args: argparse.Namespace, token: str) -> int:
             print(f"sync_issue: dry run, would open an issue titled {args.title!r}")
             emit("issue-number", "")
             return 0
+        # A create is not idempotent: a retry after a possible send is a duplicate
+        # issue, not a recovery, so this one call gets a single attempt.
         created = get_json(
             "POST",
             token,
             f"{base}/repos/{args.owner}/{args.repo}/issues",
             {"title": args.title, "body": body, "labels": [args.label]},
+            attempts=1,
         )
         number = created.get("number") if isinstance(created, dict) else None
         if not isinstance(number, int):
@@ -314,13 +402,28 @@ def run_write(args: argparse.Namespace, token: str) -> int:
     return 0
 
 
+def run_comment(args: argparse.Namespace, token: str) -> int:
+    body_text = Path(args.body).read_text(encoding="utf-8")
+    base = api_base()
+    request(
+        "POST",
+        f"{base}/repos/{args.owner}/{args.repo}/issues/{args.number}/comments",
+        token,
+        {"body": body_text},
+        attempts=1,
+    )
+    emit("issue-number", str(args.number))
+    print(f"sync_issue: posted comment on pull request #{args.number}")
+    return 0
+
+
 def parse_args(argv: list[str] | None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
-    parser.add_argument("action", choices=("find", "write"))
+    parser.add_argument("action", choices=("find", "write", "comment"))
     parser.add_argument("--owner", default="", help="defaults to the owner of GITHUB_REPOSITORY")
     parser.add_argument("--repo", default="", help="defaults to the name in GITHUB_REPOSITORY")
-    parser.add_argument("--label", required=True)
-    parser.add_argument("--title", required=True)
+    parser.add_argument("--label", default="")
+    parser.add_argument("--title", default="")
     parser.add_argument("--previous-body-out", dest="previous_body_out", default="")
     parser.add_argument("--body", default="")
     parser.add_argument("--summary", default="")
@@ -353,16 +456,28 @@ def check_path_segments(args: argparse.Namespace) -> None:
     """Owner, repo and label go into a URL path, so they get checked before the call.
 
     A label with a slash or a query marker would move the request somewhere else in
-    the API, and a token would be sent there with it.
+    the API, and a token would be sent there with it. Label and title are only required
+    for find/write; comment uses --number and --body instead.
     """
-    for name, value in (("owner", args.owner), ("repo", args.repo), ("label", args.label)):
+    for name, value in (("owner", args.owner), ("repo", args.repo)):
         if not value or not PATH_SEGMENT.fullmatch(value):
             raise BadInput(
-                f"{name} {value!r} must be 1 to 100 characters of letters, digits, dot, "
+                f"{name} {redact(value)!r} must be 1 to 100 characters of letters, digits, dot, "
                 "dash or underscore: it goes into a URL path"
             )
-    if not args.title or len(args.title) > 256 or CONTROL_CHARS.search(args.title):
-        raise BadInput("title must be 1 to 256 characters with no control characters")
+    if args.action in ("find", "write"):
+        if not args.label or not PATH_SEGMENT.fullmatch(args.label):
+            raise BadInput(
+                f"label {redact(args.label)!r} must be 1 to 100 characters of letters, digits, "
+                "dot, dash or underscore: it goes into a URL path"
+            )
+        if not args.title or len(args.title) > 256 or CONTROL_CHARS.search(args.title):
+            raise BadInput("title must be 1 to 256 characters with no control characters")
+    if args.action == "comment":
+        if args.number is None or args.number < 1:
+            raise BadInput(f"comment needs --number, got {args.number!r}")
+        if not args.body:
+            raise BadInput("comment needs --body")
     if args.number is not None and args.number < 1:
         raise BadInput(f"--number must be positive, got {args.number}")
     if args.action == "find" and not args.previous_body_out:
@@ -387,6 +502,8 @@ def main(argv: list[str] | None = None) -> int:
     try:
         if args.action == "find":
             return run_find(args, token)
+        if args.action == "comment":
+            return run_comment(args, token)
         if not args.body or not args.summary:
             raise ApiError("write needs --body and --summary")
         Path(args.body).read_text(encoding="utf-8")

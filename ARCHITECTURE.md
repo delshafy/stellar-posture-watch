@@ -43,10 +43,10 @@ Load bearing, checked in `read_report` and `collect_findings` (`scripts/render_r
 | `network` | string, escaped | The header would not say which network was read. Refused. |
 | `ledger` | rendered as given | The "at one ledger" claim becomes unverifiable. Refused if absent. |
 | `exit_code` | must equal `--exit-code` | A report that disagrees with the process it came from is not rendered. Refused. |
-| `limits` | string | The footer that tells a reader what the report cannot see. Refused if absent. |
+| `limits` | string | The footer that tells a reader what the report cannot see. Refused if absent or not a string. |
 | `accounts` | array of objects | Everything. Refused if missing or not an array. |
 | `accounts[].snapshot.id` | string | Findings are keyed by account; without an id the row cannot be named. Refused. |
-| `accounts[].findings[].rule_id` | non-empty string | Sorted, grouped and accepted-key matching all use it. Refused if missing. |
+| `accounts[].findings[].rule_id` | non-empty string | Sorted and grouped by rule; fingerprint alone drives accepted-key matching. Refused if missing. |
 | `accounts[].findings[].severity` | `high` or `warn` | An unknown value makes the counts and the sort meaningless. Refused. |
 | `accounts[].findings[].fingerprint` | exactly `[0-9a-f]{64}` | It is the identity of a finding across runs. Refused: no fingerprint means no change detection. |
 | `accounts[].findings[].message` | string, escaped | Only display; an absent message renders empty rather than failing. |
@@ -63,20 +63,37 @@ this action exit 2 loudly**, which is what the refusals above are for. That is r
 and it is the reason `tests/fixtures/` holds captured reports instead of hand-written ones:
 a fixture typed from a spec tests the renderer against the spec, not against what Gauge
 actually emits. Gauge's own JSON writer (`internal/report/json.go`) sanitizes characters but
-does not escape markdown markup, which is why escaping lives here and not there.
+does not escape markdown markup, which is why escaping lives here and not there. In
+`scripts/render_report.py`, `escape()` escapes `MARKDOWN_SPECIAL` first (which includes `&`),
+then rewrites mentions to `@&#8203;name`. If that order were reversed, the ampersand in the
+zero-width space entity would become `\&`, breaking the entity and allowing mentions to fire.
+The rule across the renderer is `escape()` for free text, and `fenced()` only for values Gauge
+constrains. See `docs/escape-contract.md` for the full contract and field table.
 
 ## 3. `validate_inputs.py`: the pre-flight
 
 Exit 0 or 2. It checks the Action's own surface, not Gauge's:
 
 - `gauge-ref` is exactly 40 hex characters; `gauge-repo` is `owner/name` of safe segments.
-- `fail-on` is `high` or `warn`; label and title are non-empty, at most 256 characters, and
-  carry no control character or newline.
-- `config` is a path inside the workspace: not absolute, no `..` segment, existing, a regular
-  file, at most 1 MiB.
+- `fail-on` is `high` or `warn`; label and title are non-empty, not blank once trimmed, each
+  within its own limit (`MAX_LABEL_CHARS` is GitHub's 50 for a label name, `MAX_TEXT_INPUT` is
+  256 for a title), carry no control character or newline, and carry no Unicode format character
+  either: a RIGHT-TO-LEFT OVERRIDE or a ZERO WIDTH SPACE renders an issue title as something
+  other than what the workflow file says, so the name is refused by code point outside ASCII
+  rather than by alphabet. Blank and empty are refused as two
+  different lines because the operator has two different mistakes to find, and neither value is
+  trimmed on the way through: an issue is titled what the input said.
+- `break-build`, `dry-run`, and `update-on-no-change` are exactly `true` or `false`.
+- `config` is a path inside the workspace: not absolute, no `..` segment, resolving to a path
+  under the checkout so that a committed symlink cannot hand Gauge a file outside it, existing,
+  a regular file, at most 1 MiB. A link that points at nothing says so rather than saying the
+  file is missing, because those are two different files to go looking for. The size is read off
+  the directory entry before the file, so a caller who
+  points at a large file is refused without the pre-flight holding it.
 - The policy file itself parses as TOML with `version = 1`, names a network, lists https
-  endpoints, and has at least one `[[account]]` whose `id` decodes as a canonical `G...`
-  strkey. An `M...`, `C...` or seed-shaped address gets its own message.
+  endpoints with none of them repeated, and has at least one `[[account]]` whose `id` decodes as
+  a canonical `G...` strkey. An `M...`, `C...` or seed-shaped address gets its own message. A
+  repeated endpoint names both indexes, because the second one is the line to delete.
 - A seed-shaped string anywhere in the raw policy text is refused, with the head and tail of
   the token printed but never the whole thing, and with a line saying whether its checksum
   verifies, because one that does must be treated as live and rotated.
@@ -110,8 +127,11 @@ heading, and never reappears as a change.
 cannot contain `--` and a finding message can; the encoding is what lets the payload survive
 a round trip through the issue API. Up to `MAX_STATE_ENTRIES` (200) findings or
 `MAX_MARKER_CHARS` (20 000) characters, whichever comes first. Anything left out is counted
-and the body opens with a bold **Change detection is partial.** line naming both numbers,
-because a silently truncated marker would report "unchanged" for findings nobody compared.
+and emitted after the status paragraph with a bold **Change detection is partial.** line
+naming both numbers, because a silently truncated marker would report "unchanged" for
+findings nobody compared. Dropped findings create a blind spot: they cannot later appear under
+Resolved if they get fixed. See `docs/state-marker.md` for the budget, ordering, notice and
+blind spot.
 
 If a human edits the body and destroys the marker, `decode_state` returns `None` and the
 next run declares a baseline rather than inventing a diff. That is the known cost of D-07,
@@ -163,13 +183,15 @@ across five files, no network beyond loopback, and none of them starts a runner.
 |---|---|---|
 | Input unusable (bad sha, bad path, bad policy) | `validate_inputs.py` | First step fails, exit 2, nothing fetched, no issue touched. |
 | Gauge refuses the config (exit 2) | `render_report.py` | Gauge writes no report to stdout on a usage error, so the renderer refuses an empty file and the run is red at that step. No issue is opened or edited. |
-| Endpoint unreachable, or one account read fails (exit 3) | `render_report.py` | Same shape: `internal/run` cancels on the first fetch error and returns no report, so the body is never rendered and the run is red. Gauge's stderr goes up as the `gauge-diagnostics` artifact. |
+| Endpoint unreachable, or one account read fails (exit 3) | `render_report.py` | Same shape: `internal/run` cancels on the first fetch error and returns no report, so the body is never rendered and the run is red. Gauge's stderr goes up as the `gauge-diagnostics-audit-exit-3` artifact. |
 | Network mismatch (exit 1) | Renders | Each account row says `not read: the endpoint is on a different network`, `acct-network-mismatch` carries the finding, and the run is green by D-05. |
 | Account not on this endpoint (exit 1) | Renders | The row says `not found on this endpoint` and carries `(not read)` in its data columns, so an absent account never reads as a configured one. |
 | Report inconsistent with the run | `render_report.py` | Exit 2, body never written, no API call made. |
 | Issue API unreachable or refused | `sync_issue.py` | Exit 3 with the token masked. The audit still ran, so the `exit-code` output is intact. |
 | Body over the API limit | `sync_issue.py` | Rows trimmed with a visible count, or exit 3 if trimming cannot fit. |
 | Findings present | `Propagate` step | Green by default (D-05), and the issue is the record. Red with `break-build: true`. |
+
+See `docs/refusal-classes.md` for the catalog of exit-2 refusal messages, message shapes and their test coverage.
 
 A run that fails before the write step leaves the previous issue body untouched, which is
 the intended behavior: a broken read must not look like a fixed account. Exit 2 and exit 3

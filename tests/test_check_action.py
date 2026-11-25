@@ -59,6 +59,7 @@ runs:
       env:
         CONFIG: ${{ inputs.config }}
         GAUGE_REF: ${{ inputs.gauge-ref }}
+        TOKEN: ${{ inputs.github-token }}
       run: |
         echo "$CONFIG" "$GAUGE_REF"
 
@@ -154,20 +155,14 @@ class Checker(unittest.TestCase):
         text = GOOD.replace("  config:\n", f"{extra}  config:\n")
         self.assertTrue(self.mentions(self.problems(text), "fail-on is declared but never bound"))
 
-    def test_github_token_is_exempt_from_binding(self) -> None:
-        # It arrives through the step's env in the real action, but as a credential it is the
-        # one input the checker does not require a step to name. Removing every other binding
-        # leaves only github-token unused, and that alone must not be a problem.
-        config_block = (
-            "  config:\n    description: Policy path.\n"
-            "    required: false\n    default: gauge.toml\n"
-        )
-        text = (
-            GOOD.replace(config_block, "")
-            .replace("        CONFIG: ${{ inputs.config }}\n", "")
-            .replace('echo "$CONFIG" "$GAUGE_REF"', 'echo "$GAUGE_REF"')
-        )
-        self.assertEqual(self.problems(text), [])
+    def test_github_token_is_not_exempt_from_binding(self) -> None:
+        # #67 deleted the carve-out. It dated from when the token was described in prose
+        # only; the shipped file binds it, so the rule now reads the same for every declared
+        # input, and a token reaching no step is reported instead of hidden.
+        text = GOOD.replace("        TOKEN: ${{ inputs.github-token }}\n", "")
+        problems = self.problems(text)
+        self.assertEqual(len(problems), 1, problems)
+        self.assertIn("github-token is declared but never bound", problems[0])
 
     def test_unpinned_action_is_refused(self) -> None:
         text = GOOD.replace(CHECKOUT, "actions/checkout@v7.0.1")

@@ -31,7 +31,7 @@ says why in one line.
 |---|---|
 | `gauge-ref` is a full commit sha, with no default. | `validate_inputs.py` refuses anything that is not `[0-9a-f]{40}`, and `render_report.py` refuses it again on the way to the body. A branch name would change what gets compiled without changing a file in the consumer's repository. |
 | No input reaches a shell command. | Every step in `action.yml` passes its inputs through `env:`. There is no `${{ inputs.* }}` inside a `run:` block to inject into, which is the class of bug that makes composite actions dangerous. |
-| The report never reaches the log. | D-06. The audit step redirects stdout to `$RUNNER_TEMP/report.json` and stderr to a file, prints one line of byte counts, and the diagnostics artifact is uploaded only `if: failure()`. |
+| The report never reaches the log. | D-06. The audit step redirects stdout to `$RUNNER_TEMP/report.json` and stderr to a file, prints one line of byte counts, and the diagnostics artifact is uploaded only on Gauge's own exit 2 or 3. Not `if: failure()`: the audit step ends `exit 0` and publishes its status through an output, so `failure()` there catches the checkout, the Go build and a render refusal, and uploads a stderr file from a run whose audit succeeded. |
 | A seed-shaped string is refused, quietly. | `validate_inputs.py` sweeps the raw policy text and prints only the head and tail of the token, with a line saying whether its checksum verifies, because one that does is live and needs rotating. `tests/fixtures/README.md` and its test refuse a fixture that carries one. |
 | Only `G...` addresses. | The validator refuses `M...`, `C...` and seed-shaped values with a message naming each, then checks shape, checksum and version byte. Gauge re-checks this in `internal/policy`; the pre-flight exists so a bad address costs seconds rather than a Go build. |
 | Markdown markup from the chain is neutralised. | `escape()` in `render_report.py` backslash-escapes markup characters and rewrites `@mentions` with a zero-width space; `fenced()` turns inner backticks into `&#96;`. `report-hostile-strings.json` is the fixture that proves a `home_domain` cannot open a link or notify `@all`. |
@@ -41,7 +41,7 @@ says why in one line.
 | The token is never an argument. | `POSTURE_WATCH_TOKEN` in the step's `env`, and `redact()` masks a bearer value in every failure message. |
 | Python standard library only. | D-02. The three scripts import nothing outside it; `tomllib` (3.11+) is the only non-obvious one. `requirements-dev.txt` is dev tooling, not a runtime dependency, and no workflow installs anything. |
 | Tests do not touch the network. | The only sockets are loopback servers started inside the test process, plus subprocesses of the three scripts over a temporary directory. |
-| A schedule stays green for findings and red for failures. | D-05, mapped in the last step of `action.yml`. Do not "fix" a red run by weakening this: exit 2 and 3 mean nothing was read. |
+| A schedule stays green for findings and red for failures. | D-05, mapped in the last step of `action.yml`, and `tests/test_action_exit_codes.py` executes that block out of the file against a twelve row table. Do not "fix" a red run by weakening this: exit 2 and 3 mean nothing was read. |
 | Never weaken, skip or delete a check to make something pass. | If a test is wrong, fix the test and say why in the pull request. If a check is wrong, the check is the bug. |
 
 ## Workflow

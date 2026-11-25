@@ -18,6 +18,7 @@ from tempfile import TemporaryDirectory
 from typing import Any
 
 ROOT = Path(__file__).resolve().parent.parent
+sys.path.insert(0, str(ROOT / "scripts"))
 SCRIPT = ROOT / "scripts" / "render_report.py"
 FIXTURES = ROOT / "tests" / "fixtures"
 PIN = "da656733fff839d5cf20f795460f4365a7254257"
@@ -749,6 +750,74 @@ class TestFixtureProvenance(unittest.TestCase):
         pattern = re.compile(r"(?<![A-Z2-7])S[A-Z2-7]{55}(?![A-Z2-7])")
         for path in FIXTURES.glob("*.json"):
             self.assertIsNone(pattern.search(path.read_text()), path.name)
+
+
+class TestSARIFRender(Renderer):
+    def render_sarif(self, fixture: str) -> dict[str, Any]:
+        import render_report as rr  # type: ignore[import-not-found]
+
+        report_path = FIXTURES / fixture
+        report = json.loads(report_path.read_text())
+        return rr.render_sarif(
+            report,
+            gauge_ref=PIN,
+            gauge_repo="posture-sec/guage",
+            config=str(report_path),
+        )
+
+    def test_findings_report_produces_results(self) -> None:
+        sarif = self.render_sarif("report-findings.json")
+        runs = sarif["runs"]
+        self.assertEqual(len(runs), 1)
+        self.assertGreater(len(runs[0]["results"]), 0)
+
+    def test_clean_report_produces_no_results(self) -> None:
+        sarif = self.render_sarif("report-clean.json")
+        self.assertEqual(sarif["runs"][0]["results"], [])
+
+    def test_sarif_version_is_2_1_0(self) -> None:
+        sarif = self.render_sarif("report-findings.json")
+        self.assertEqual(sarif["version"], "2.1.0")
+        self.assertIn("2.1.0", sarif["$schema"])
+
+    def test_high_severity_maps_to_error(self) -> None:
+        sarif = self.render_sarif("report-findings.json")
+        results = sarif["runs"][0]["results"]
+        high_results = [r for r in results if r["level"] == "error"]
+        # At least one high finding should map to error
+        self.assertTrue(high_results)
+        all_levels = {r["level"] for r in results}
+        self.assertIn("error", all_levels)
+
+    def test_warn_severity_maps_to_warning(self) -> None:
+        # Use the report that has warn findings
+        report_path = FIXTURES / "report-findings.json"
+        report = json.loads(report_path.read_text())
+        # Inject a warn finding
+        for account in report["accounts"]:
+            for finding in account.get("findings") or []:
+                finding["severity"] = "warn"
+                break
+        import render_report as rr  # type: ignore[import-not-found]
+
+        sarif = rr.render_sarif(report, PIN, "posture-sec/guage", str(report_path))
+        levels = {r["level"] for r in sarif["runs"][0]["results"]}  # type: ignore[index]
+        self.assertIn("warning", levels)
+
+    def test_sarif_tool_name_is_stellar_gauge(self) -> None:
+        sarif = self.render_sarif("report-findings.json")
+        driver = sarif["runs"][0]["tool"]["driver"]
+        self.assertEqual(driver["name"], "stellar-gauge")
+
+    def test_sarif_out_flag_writes_file(self) -> None:
+        code, _body, _summary, err = self.render(
+            "report-findings.json", extra={"sarif-out": str(self.tmp / "out.sarif")}
+        )
+        self.assertEqual(code, 0, err)
+        sarif_path = self.tmp / "out.sarif"
+        self.assertTrue(sarif_path.exists())
+        sarif = json.loads(sarif_path.read_text())
+        self.assertEqual(sarif["version"], "2.1.0")
 
 
 if __name__ == "__main__":
